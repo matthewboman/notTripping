@@ -1,6 +1,7 @@
 import argparse
 import platform
 import time
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -8,29 +9,58 @@ import torch
 
 from deepdream import DeepDream
 
+WINDOW_TITLE = "DreamCam"
+
+DEFAULT_CAMERA_INDEX = 0
+DEFAULT_PROCESSING_WIDTH = 192
+DEFAULT_DREAM_STEPS = 2
+DEFAULT_STEP_SIZE = 0.022
+DEFAULT_FEEDBACK = 0.42
+
+STATUS_POSITION = (20, 35)
+STATUS_FONT_SCALE = 0.7
+STATUS_THICKNESS = 2
+
+# Farneback optical-flow settings. These values favor responsiveness at the
+# small processing resolutions used by DreamCam.
+FLOW_PYRAMID_SCALE = 0.5
+FLOW_LEVELS = 2
+FLOW_WINDOW_SIZE = 15
+FLOW_ITERATIONS = 2
+FLOW_POLY_N = 5
+FLOW_POLY_SIGMA = 1.2
+
+
 def get_device():
+  """Select the fastest PyTorch backend available on the current machine."""
   if torch.cuda.is_available():
     return torch.device("cuda")
 
-  if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+  if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
     return torch.device("mps")
 
-  if (hasattr(torch, "xpu") and torch.xpu.is_available()):
+  if hasattr(torch, "xpu") and torch.xpu.is_available():
     return torch.device("xpu")
 
   return torch.device("cpu")
 
+
 def frame_to_tensor(frame, device):
-  frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+  """Convert an OpenCV BGR frame into a normalized NCHW RGB tensor."""
+  rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-  tensor = torch.from_numpy(frame)
-  tensor = tensor.permute(2, 0, 1)
-  tensor = tensor.unsqueeze(0)
-  tensor = tensor.float() / 255.0
+  tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
+  tensor = tensor.to(device=device, dtype=torch.float32)
+  tensor.div_(255.0)
 
-  return tensor.to(device)
+  if device.type == "cpu":
+    tensor = tensor.contiguous(memory_format=torch.channels_last)
+
+  return tensor
+
 
 def tensor_to_frame(tensor):
+  """Convert a DreamCam RGB tensor back into an OpenCV BGR uint8 frame."""
   image = tensor.detach().squeeze(0)
   image = image.permute(1, 2, 0)
   image = image.clamp(0.0, 1.0)
@@ -38,9 +68,12 @@ def tensor_to_frame(tensor):
 
   image = np.clip(image * 255.0, 0, 255).astype(np.uint8)
 
+  # RGB -> BGR without cvtColor, which also avoids CV_8S issues
   return image[:, :, ::-1].copy()
 
+
 def resize_for_processing(frame, width):
+  """Resize a camera frame while preserving its aspect ratio."""
   height, original_width = frame.shape[:2]
 
   scale = width / original_width
@@ -49,133 +82,63 @@ def resize_for_processing(frame, width):
   return cv2.resize(
     frame,
     (width, resized_height),
-    interpolation=cv2.INTER_AREA
+    interpolation=cv2.INTER_AREA,
   )
 
+
 def blend_frames(current, feedback, amount):
+  """
+  Mix fresh video with the motion-aligned previous dream.
+
+  Lower feedback reacts faster to live video. Higher feedback preserves more of
+  the evolving hallucination between frames.
+  """
   if feedback is None or amount <= 0:
     return current
 
-  return (current * (1.0 - amount) + feedback * amount).clamp(0.0, 1.0)
+  return ( current * (1.0 - amount) + feedback * amount).clamp(0.0, 1.0)
 
 
-def warp_dream(dreamed, current_frame, device, amount):
-    if amount <= 0:
-        return dreamed
+@lru_cache(maxsize=4)
+def remap_grid(height, width):
+  """Cache the static pixel-coordinate grid used by optical-flow remapping."""
+  grid_x, grid_y = np.meshgrid(
+    np.arange(width, dtype=np.float32),
+    np.arange(height, dtype=np.float32),
+  )
 
-    dream_frame = tensor_to_frame(dreamed)
+  return grid_x, grid_y
 
-    dream_gray = cv2.cvtColor(
-        dream_frame,
-        cv2.COLOR_BGR2GRAY,
-    ).astype(np.float32) / 255.0
-
-    current_gray = cv2.cvtColor(
-        current_frame,
-        cv2.COLOR_BGR2GRAY,
-    ).astype(np.float32) / 255.0
-
-    residual = dream_gray - current_gray
-
-    residual = cv2.GaussianBlur(
-        residual,
-        (0, 0),
-        2.5,
-    )
-
-    gradient_x = cv2.Sobel(
-        current_gray,
-        cv2.CV_32F,
-        1,
-        0,
-        ksize=3,
-    )
-
-    gradient_y = cv2.Sobel(
-        current_gray,
-        cv2.CV_32F,
-        0,
-        1,
-        ksize=3,
-    )
-
-    magnitude = np.sqrt(
-        gradient_x ** 2
-        + gradient_y ** 2
-    )
-
-    normal_x = gradient_x / (magnitude + 1e-6)
-    normal_y = gradient_y / (magnitude + 1e-6)
-
-    edge_scale = np.percentile(magnitude, 90)
-
-    edge_mask = np.clip(
-        magnitude / (edge_scale + 1e-6),
-        0.0,
-        1.0,
-    )
-
-    edge_mask = cv2.GaussianBlur(
-        edge_mask,
-        (0, 0),
-        2.0,
-    )
-
-    displacement = (
-        np.tanh(residual * 6.0)
-        * edge_mask
-        * amount
-    )
-
-    height, width = current_gray.shape
-
-    grid_x, grid_y = np.meshgrid(
-        np.arange(width, dtype=np.float32),
-        np.arange(height, dtype=np.float32),
-    )
-
-    map_x = grid_x + normal_x * displacement
-    map_y = grid_y + normal_y * displacement
-
-    warped = cv2.remap(
-        dream_frame,
-        map_x,
-        map_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_REFLECT,
-    )
-
-    return frame_to_tensor(
-        warped,
-        device,
-    )
 
 def warp_feedback(previous_dream, previous_frame, current_frame, device):
+  """
+  Move the previous hallucination with motion in the live camera image.
+
+  Optical flow is calculated from the previous webcam frame to the current
+  webcam frame. The previous dream is then remapped along that motion before it
+  is mixed into the new frame, reducing stationary ghost trails.
+  """
   previous_gray = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
-  current_gray = cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY)
+  current_gray = cv2.cvtColor(current_frame, cv2.COLOR_BGR2GRAY)
 
   flow = cv2.calcOpticalFlowFarneback(
     previous_gray,
     current_gray,
     None,
-    0.5,
-    3,
-    15,
-    3,
-    5,
-    1.2,
+    FLOW_PYRAMID_SCALE,
+    FLOW_LEVELS,
+    FLOW_WINDOW_SIZE,
+    FLOW_ITERATIONS,
+    FLOW_POLY_N,
+    FLOW_POLY_SIGMA,
     0,
   )
 
   height, width = current_gray.shape
+  grid_x, grid_y = remap_grid(height, width)
 
-  grid_x, grid_y = np.meshgrid(
-    np.arange(width),
-    np.arange(height),
-  )
-
-  map_x = (grid_x - flow[:, :, 0]).astype(np.float32)
-  map_y = (grid_y - flow[:, :, 1]).astype(np.float32)
+  map_x = grid_x - flow[:, :, 0]
+  map_y = grid_y - flow[:, :, 1]
 
   previous_image = tensor_to_frame(previous_dream)
 
@@ -189,7 +152,9 @@ def warp_feedback(previous_dream, previous_frame, current_frame, device):
 
   return frame_to_tensor(warped, device)
 
+
 def draw_status(frame, device, fps, paused):
+  """Draw the active compute backend and measured dream-update FPS."""
   status = f"{device.type.upper()} | {fps:.1f} FPS"
 
   if paused:
@@ -198,19 +163,21 @@ def draw_status(frame, device, fps, paused):
   cv2.putText(
     frame,
     status,
-    (20, 35),
+    STATUS_POSITION,
     cv2.FONT_HERSHEY_SIMPLEX,
-    0.7,
+    STATUS_FONT_SCALE,
     (255, 255, 255),
-    2,
-    cv2.LINE_AA
+    STATUS_THICKNESS,
+    cv2.LINE_AA,
   )
 
+
 def open_camera(camera_index):
+  """Open the requested webcam with the appropriate macOS backend when needed."""
   if platform.system() == "Darwin":
     capture = cv2.VideoCapture(
       camera_index,
-      cv2.CAP_AVFOUNDATION
+      cv2.CAP_AVFOUNDATION,
     )
   else:
     capture = cv2.VideoCapture(camera_index)
@@ -222,71 +189,55 @@ def open_camera(camera_index):
 
   return capture
 
+
 def parse_args():
   parser = argparse.ArgumentParser(
-    description="Real-time DeepDream webcam"
+    description="Real-time recursive DeepDream webcam",
   )
 
   parser.add_argument(
     "--camera",
     type=int,
-    default=0,
+    default=DEFAULT_CAMERA_INDEX,
+    help="OpenCV camera index.",
   )
 
   parser.add_argument(
     "--width",
     type=int,
-    default=320,
+    default=DEFAULT_PROCESSING_WIDTH,
+    help="Width used for neural processing. Lower values are much faster.",
   )
 
-  # how many DeepDream gradient-ascent passes happen per video frame
   parser.add_argument(
     "--steps",
     type=int,
-    default=1,
+    default=DEFAULT_DREAM_STEPS,
+    help="DeepDream gradient iterations performed for each video update.",
   )
 
-  # 0.005  subtle
-  # 0.015  noticeable
-  # 0.025  strong
-  # 0.05   aggressive
   parser.add_argument(
     "--step-size",
     type=float,
-    default=0.02,
+    default=DEFAULT_STEP_SIZE,
+    help="Strength of each individual DeepDream gradient update.",
   )
 
-  parser.add_argument(
-    "--layer",
-    type=int,
-    default=23,
-  )
-
-  # how much of the previous dreamed frame survives into the next frame versus how much fresh webcam imagery comes in
   parser.add_argument(
     "--feedback",
     type=float,
-    default=0.15,
-  )
-
-  parser.add_argument(
-    "--feedback-gain",
-    type=float,
-    default=1.15,
-  )
-
-  parser.add_argument(
-    "--warp",
-    type=float,
-    default=4.0,
+    default=DEFAULT_FEEDBACK,
+    help="Fraction of the motion-aligned previous dream mixed into the new frame.",
   )
 
   parser.add_argument(
     "--mirror",
-    action="store_true"
+    action="store_true",
+    help="Mirror the webcam image horizontally.",
   )
 
   return parser.parse_args()
+
 
 def main():
   args = parse_args()
@@ -305,7 +256,7 @@ def main():
   dreamer = DeepDream(
     device=device,
     steps=args.steps,
-    step_size=args.step_size
+    step_size=args.step_size,
   )
 
   capture = open_camera(args.camera)
@@ -334,7 +285,8 @@ def main():
         original_height, original_width = frame.shape[:2]
         processed_frame = resize_for_processing(frame, args.width)
 
-        tensor = frame_to_tensor(processed_frame, device)
+        # Convert the current webcam frame exactly once.
+        current = frame_to_tensor(processed_frame, device)
 
         feedback = None
 
@@ -346,35 +298,25 @@ def main():
             device,
           )
 
-        tensor = blend_frames(
-          tensor,
+        dream_input = blend_frames(
+          current,
           feedback,
           args.feedback,
         )
 
-        dreamed = dreamer.dream(
-          tensor,
-          frame_to_tensor(
-            processed_frame,
-            device,
-          ),
-        )
-        dreamed = warp_dream(
-          dreamed,
-          processed_frame,
-          device,
-          args.warp,
-        )
-        previous_dream = dreamed.detach()
+        # Classic DeepDream directly amplifies features in the recurrent image.
+        # The live webcam remains coupled through dream_input and optical flow.
+        dreamed = dreamer.dream(dream_input)
+
+        previous_dream = dreamed
         previous_frame = processed_frame.copy()
 
         output = tensor_to_frame(dreamed)
-        output = cv2.resize(
+        last_output = cv2.resize(
           output,
           (original_width, original_height),
-          interpolation=cv2.INTER_LINEAR
+          interpolation=cv2.INTER_LINEAR,
         )
-        last_output = output
 
         fps_frames += 1
         now = time.perf_counter()
@@ -385,29 +327,29 @@ def main():
           fps_frames = 0
           fps_started = now
 
-        if last_output is not None:
-          display = last_output.copy()
+      if last_output is not None:
+        display = last_output.copy()
 
-          draw_status(
-            display,
-            device,
-            fps,
-            paused
-          )
+        draw_status(
+          display,
+          device,
+          fps,
+          paused,
+        )
 
-          cv2.imshow("DreamCam", display)
+        cv2.imshow(WINDOW_TITLE, display)
 
-        key = cv2.waitKey(1) & 0xFF
+      key = cv2.waitKey(1) & 0xFF
 
-        if key == ord("q") or key == 27:
-          break
+      if key == ord("q") or key == 27:
+        break
 
-        if key == ord(" "):
-          paused = not paused
+      if key == ord(" "):
+        paused = not paused
 
-        if key == ord("r"):
-          previous_dream = None
-          previous_frame = None
+      if key == ord("r"):
+        previous_dream = None
+        previous_frame = None
 
   finally:
     capture.release()
