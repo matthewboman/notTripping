@@ -83,6 +83,9 @@ def parse_args():
   parser.add_argument("--steps", type=int, default=DEFAULT_DREAM_STEPS)
   parser.add_argument("--step-size", type=float, default=DEFAULT_STEP_SIZE)
   parser.add_argument("--feedback", type=float, default=DEFAULT_FEEDBACK)
+  parser.add_argument("--model", choices=["vgg16", "googlenet"], default="vgg16")
+  parser.add_argument("--octaves", type=int, default=1)
+  parser.add_argument("--octave-scale", type=float, default=2.0)
   parser.add_argument("--mirror", action="store_true")
 
   return parser.parse_args()
@@ -98,9 +101,14 @@ def main():
     device=device,
     steps=args.steps,
     step_size=args.step_size,
-    octaves=1,
+    octaves=args.octaves,
+    octave_scale=args.octave_scale,
     max_whole_frame_width=0,
+    model_name=args.model,
   )
+
+  print(f"Requested model: {args.model}")
+  print(f"Loaded model: {type(dreamer.model).__name__}")
 
   capture = open_camera(args.camera)
 

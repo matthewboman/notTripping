@@ -14,8 +14,10 @@ WINDOW_TITLE = "DreamCam"
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_PROCESSING_WIDTH = 192
 DEFAULT_DREAM_STEPS = 2
-DEFAULT_STEP_SIZE = 0.022
-DEFAULT_FEEDBACK = 0.42
+DEFAULT_STEP_SIZE = 0.020
+DEFAULT_FEEDBACK = 0.35
+DEFAULT_OCTAVES = 2
+DEFAULT_OCTAVE_SCALE = 2.0
 
 STATUS_POSITION = (20, 35)
 STATUS_FONT_SCALE = 0.7
@@ -231,6 +233,26 @@ def parse_args():
   )
 
   parser.add_argument(
+    "--octaves",
+    type=int,
+    default=DEFAULT_OCTAVES,
+    help="Number of scales used to build large hallucinated structure.",
+  )
+
+  parser.add_argument(
+    "--octave-scale",
+    type=float,
+    default=DEFAULT_OCTAVE_SCALE,
+    help="Resolution multiplier between successive dream octaves.",
+  )
+
+  parser.add_argument(
+    "--model",
+    choices=["vgg16", "googlenet"],
+    default="vgg16",
+  )
+
+  parser.add_argument(
     "--mirror",
     action="store_true",
     help="Mirror the webcam image horizontally.",
@@ -257,6 +279,9 @@ def main():
     device=device,
     steps=args.steps,
     step_size=args.step_size,
+    octaves=args.octaves,
+    octave_scale=args.octave_scale,
+    model_name=args.model,
   )
 
   capture = open_camera(args.camera)

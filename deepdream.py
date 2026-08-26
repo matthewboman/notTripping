@@ -4,10 +4,32 @@ from torchvision.models import VGG16_Weights, vgg16, GoogLeNet_Weights, googlene
 
 # https://distill.pub/2017/feature-visualization
 GOOGLENET_DREAM_LAYER_WEIGHTS = {
-  "mixed3a": 0.25,
-  "mixed4a": 0.15,
-  "mixed4d": 0.35,
-  "mixed4e": 0.25,
+  # "mixed3a": 1.0,
+  # "mixed4a": 0.55,
+  # "mixed4b": 0.25,
+  # "mixed4c": 0.8,
+  # "mixed4d": 0.35,
+  # "mixed4e": 0.55,
+  # "mixed5a": 0.55,
+  "mixed5b": 1.0,
+}
+
+GOOGLENET_DREAM_TARGETS = {
+  "mixed5b": [896]
+}
+
+GOOGLENET_DREAM_TARGETS = {
+  "mixed3a": [32, 96, 160, 224],          # 256 channels
+  "mixed3b": [60, 180, 300, 420],         # 480 channels
+
+  "mixed4a": [64, 192, 320, 448],         # 512 channels
+  "mixed4b": [64, 192, 320, 448],         # 512 channels
+  "mixed4c": [64, 192, 320, 448],         # 512 channels
+  "mixed4d": [66, 198, 330, 462],         # 528 channels
+  "mixed4e": [104, 312, 520, 728],        # 832 channels
+
+  "mixed5a": [104, 312, 520, 728],        # 832 channels
+  "mixed5b": [128, 384, 640, 896],        # 1024 channels
 }
 
 # VGG16 activation layers.
@@ -141,44 +163,41 @@ class DeepDream:
     x = self.normalize(image)
     loss = image.new_zeros(())
 
-    x = self.model.conv1(x)
-    x = self.model.maxpool1(x)
-    x = self.model.conv2(x)
-    x = self.model.conv3(x)
-    x = self.model.maxpool2(x)
+    layers = [
+      ("conv1", self.model.conv1),
+      ("maxpool1", self.model.maxpool1),
+      ("conv2", self.model.conv2),
+      ("conv3", self.model.conv3),
+      ("maxpool2", self.model.maxpool2),
 
-    x = self.model.inception3a(x)
+      ("mixed3a", self.model.inception3a),
+      ("mixed3b", self.model.inception3b),
 
-    loss += (
-      x.square().mean()
-      * self.dream_layer_weights["mixed3a"]
-    )
+      ("maxpool3", self.model.maxpool3),
 
-    x = self.model.inception3b(x)
-    x = self.model.maxpool3(x)
+      ("mixed4a", self.model.inception4a),
+      ("mixed4b", self.model.inception4b),
+      ("mixed4c", self.model.inception4c),
+      ("mixed4d", self.model.inception4d),
+      ("mixed4e", self.model.inception4e),
 
-    x = self.model.inception4a(x)
+      ("maxpool4", self.model.maxpool4),
 
-    loss += (
-      x.square().mean()
-      * self.dream_layer_weights["mixed4a"]
-    )
+      ("mixed5a", self.model.inception5a),
+      ("mixed5b", self.model.inception5b),
+    ]
 
-    x = self.model.inception4b(x)
-    x = self.model.inception4c(x)
-    x = self.model.inception4d(x)
+    for name, layer in layers:
+      x = layer(x)
 
-    loss += (
-      x.square().mean()
-      * self.dream_layer_weights["mixed4d"]
-    )
+      if name in GOOGLENET_DREAM_TARGETS:
+        channels = GOOGLENET_DREAM_TARGETS[name]
+        loss += x[:, channels].mean()
+        # loss += x[:, channels].square().mean()
 
-    x = self.model.inception4e(x)
-
-    loss += (
-      x.square().mean()
-      * self.dream_layer_weights["mixed4e"]
-    )
+      elif name in GOOGLENET_DREAM_LAYER_WEIGHTS:
+        loss += x.mean() * GOOGLENET_DREAM_LAYER_WEIGHTS[name]
+        # loss += x.square().mean() * GOOGLENET_DREAM_LAYER_WEIGHTS[name]
 
     return loss
 
@@ -297,7 +316,8 @@ class DeepDream:
         create_graph=False,
       )[0]
 
-      gradient = gradient / gradient.std().clamp_min(GRADIENT_EPSILON)
+      # gradient = gradient / gradient.std().clamp_min(GRADIENT_EPSILON)
+      gradient = gradient / gradient.abs().mean().clamp_min(GRADIENT_EPSILON)
 
       dreamed = (
         dreamed
