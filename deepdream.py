@@ -1,36 +1,34 @@
 import torch
 import torch.nn.functional as F
-from torchvision.models import VGG16_Weights, vgg16, GoogLeNet_Weights, googlenet
+import onnx
+from onnx2torch import convert
+from torchvision.models import VGG16_Weights, vgg16
 
 # https://distill.pub/2017/feature-visualization
 GOOGLENET_DREAM_LAYER_WEIGHTS = {
-  # "mixed3a": 1.0,
-  # "mixed4a": 0.55,
-  # "mixed4b": 0.25,
-  # "mixed4c": 0.8,
-  # "mixed4d": 0.35,
-  # "mixed4e": 0.55,
-  # "mixed5a": 0.55,
-  "mixed5b": 1.0,
+  # "Concat":   1.0,   # inception3a
+  # "Concat_1": 1.0,  # inception3b
+  # "Concat_2": 1.0,  # inception4a
+  # "Concat_3": 1.0,   # inception4b
+  # "Concat_4": 1.0,  # inception4c # try ones above and below w lower feedback
+  "Concat_5": 1.0,  # inception4d
+  # "Concat_6": 1.0,  # inception4e
+  # "Concat_7": 1.0,  # inception5a
+  # "Concat_8": 1.0,   # inception5b
 }
 
-GOOGLENET_DREAM_TARGETS = {
-  "mixed5b": [896]
-}
-
-GOOGLENET_DREAM_TARGETS = {
-  "mixed3a": [32, 96, 160, 224],          # 256 channels
-  "mixed3b": [60, 180, 300, 420],         # 480 channels
-
-  "mixed4a": [64, 192, 320, 448],         # 512 channels
-  "mixed4b": [64, 192, 320, 448],         # 512 channels
-  "mixed4c": [64, 192, 320, 448],         # 512 channels
-  "mixed4d": [66, 198, 330, 462],         # 528 channels
-  "mixed4e": [104, 312, 520, 728],        # 832 channels
-
-  "mixed5a": [104, 312, 520, 728],        # 832 channels
-  "mixed5b": [128, 384, 640, 896],        # 1024 channels
-}
+GOOGLENET_DREAM_TARGETS = {}
+# GOOGLENET_DREAM_TARGETS = {
+#   "Concat":   [32, 96, 160, 224],
+#   "Concat_1": [60, 180, 300, 420],
+#   "Concat_2": [64, 192, 320, 448],
+#   "Concat_3": [64, 192, 320, 448],
+#   "Concat_4": [64, 192, 320, 448],
+#   "Concat_5": [66, 198, 330, 462],
+#   "Concat_6": [104, 312, 520, 728],
+#   "Concat_7": [104, 312, 520, 728],
+#   "Concat_8": [128, 384, 640, 896],
+# }
 
 # VGG16 activation layers.
 VGG_RELU2_3 = 8
@@ -39,7 +37,7 @@ VGG_RELU4_3 = 22
 VGG_RELU5_3 = 29
 
 DREAM_LAYER_WEIGHTS = {
-  VGG_RELU3_3: 0.10,
+  VGG_RELU3_3: 0.15,
   VGG_RELU4_3: 0.45,
   VGG_RELU5_3: 0.45,
 }
@@ -103,11 +101,8 @@ class DeepDream:
       }
 
     elif self.model_name == "googlenet":
-      self.model = googlenet(
-        weights=GoogLeNet_Weights.DEFAULT,
-        aux_logits=True,
-      )
-
+      self.model = convert(onnx.load("googlenet-no-dropout.onnx"))
+      self.model.AveragePool = torch.nn.AdaptiveAvgPool2d((1, 1))
       self.dream_layer_weights = GOOGLENET_DREAM_LAYER_WEIGHTS
 
     else:
@@ -138,6 +133,17 @@ class DeepDream:
     """Normalize RGB image values for VGG16."""
     return (image - self.mean) / self.std
 
+  def normalize_googlenet(self, image):
+    x = image[:, [2, 1, 0]] * 255.0
+
+    mean = torch.tensor(
+      [104.0, 117.0, 123.0],
+      device=image.device,
+      dtype=image.dtype,
+    ).view(1, 3, 1, 1)
+
+    return x - mean
+
   def dream_loss(self, image):
     """Weighted activation-maximization objective."""
     if self.model_name == "vgg16":
@@ -160,44 +166,28 @@ class DeepDream:
     return loss
 
   def _googlenet_dream_loss(self, image):
-    x = self.normalize(image)
+    activations = {}
+
+    handles = []
+
+    for name, module in self.model.named_modules():
+      if name in GOOGLENET_DREAM_LAYER_WEIGHTS:
+        handles.append(
+          module.register_forward_hook(
+            lambda _, __, output, name=name: activations.__setitem__(name, output)
+          )
+        )
+
+    self.model(self.normalize_googlenet(image))
+
+    for handle in handles:
+      handle.remove()
+
     loss = image.new_zeros(())
 
-    layers = [
-      ("conv1", self.model.conv1),
-      ("maxpool1", self.model.maxpool1),
-      ("conv2", self.model.conv2),
-      ("conv3", self.model.conv3),
-      ("maxpool2", self.model.maxpool2),
-
-      ("mixed3a", self.model.inception3a),
-      ("mixed3b", self.model.inception3b),
-
-      ("maxpool3", self.model.maxpool3),
-
-      ("mixed4a", self.model.inception4a),
-      ("mixed4b", self.model.inception4b),
-      ("mixed4c", self.model.inception4c),
-      ("mixed4d", self.model.inception4d),
-      ("mixed4e", self.model.inception4e),
-
-      ("maxpool4", self.model.maxpool4),
-
-      ("mixed5a", self.model.inception5a),
-      ("mixed5b", self.model.inception5b),
-    ]
-
-    for name, layer in layers:
-      x = layer(x)
-
-      if name in GOOGLENET_DREAM_TARGETS:
-        channels = GOOGLENET_DREAM_TARGETS[name]
-        loss += x[:, channels].mean()
-        # loss += x[:, channels].square().mean()
-
-      elif name in GOOGLENET_DREAM_LAYER_WEIGHTS:
-        loss += x.mean() * GOOGLENET_DREAM_LAYER_WEIGHTS[name]
-        # loss += x.square().mean() * GOOGLENET_DREAM_LAYER_WEIGHTS[name]
+    for name, weight in GOOGLENET_DREAM_LAYER_WEIGHTS.items():
+      if name in activations:
+        loss += activations[name].square().mean() * weight
 
     return loss
 
@@ -301,6 +291,9 @@ class DeepDream:
     """Run repeated gradient-ascent steps on one tensor."""
     dreamed = image.detach().clone()
 
+    # prevent halucinations on black
+    content_mask = (image.abs().amax(dim=1, keepdim=True) > 1e-6).to(image.dtype)
+
     if self.use_channels_last:
       dreamed = dreamed.contiguous(memory_format=torch.channels_last)
 
@@ -316,8 +309,8 @@ class DeepDream:
         create_graph=False,
       )[0]
 
-      # gradient = gradient / gradient.std().clamp_min(GRADIENT_EPSILON)
       gradient = gradient / gradient.abs().mean().clamp_min(GRADIENT_EPSILON)
+      gradient = gradient * content_mask
 
       dreamed = (
         dreamed

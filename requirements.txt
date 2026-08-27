@@ -2,3 +2,5 @@ torch
 torchvision
 opencv-python
 numpy
+onnx
+onnx2torch

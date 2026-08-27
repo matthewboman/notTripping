@@ -19,9 +19,11 @@ from dream_utils import (
 
 DEFAULT_OUTPUT_WIDTH = 0
 
-DEFAULT_DREAM_STEPS = 3
-DEFAULT_STEP_SIZE = 0.018
-DEFAULT_FEEDBACK = 0.35
+DEFAULT_DREAM_STEPS = 2
+DEFAULT_STEP_SIZE = 0.02
+DEFAULT_FEEDBACK = 0.25
+# DEFAULT_FEEDBACK = 0.15
+
 
 DEFAULT_OCTAVES = 2
 DEFAULT_OCTAVE_SCALE = 2.0
@@ -353,13 +355,26 @@ def main():
           flow_width=args.flow_width,
         )
 
+      # Preserve genuinely black pixels from the source frame.
+      # Use a small threshold because MP4 decoding can turn nominal black into
+      # values slightly above zero.
+      content_mask = (
+        current.amax(dim=1, keepdim=True) > (2.0 / 255.0)
+      ).to(current.dtype)
+
       dream_input = blend_frames(
         current,
         feedback,
         args.feedback,
       )
 
+      # Do not allow temporal feedback into black source pixels.
+      dream_input = dream_input * content_mask
+
       dreamed = dreamer.dream(dream_input)
+
+      # Guarantee black source pixels remain black after all octaves/dreaming.
+      dreamed = dreamed * content_mask
 
       previous_dream = dreamed
       previous_frame = frame.copy()
