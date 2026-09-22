@@ -19,14 +19,14 @@ DEFAULT_FLOW_WIDTH = 480
 
 def get_device():
   """Select the fastest PyTorch backend available."""
-  if torch.cuda.is_available():
-    return torch.device("cuda")
+  # if torch.cuda.is_available():
+  #   return torch.device("cuda")
 
-  if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    return torch.device("mps")
+  # if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+  #   return torch.device("mps")
 
-  if hasattr(torch, "xpu") and torch.xpu.is_available():
-    return torch.device("xpu")
+  # if hasattr(torch, "xpu") and torch.xpu.is_available():
+  #   return torch.device("xpu")
 
   return torch.device("cpu")
 
