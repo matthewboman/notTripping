@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from torchvision.models import VGG16_Weights, vgg16, GoogLeNet_Weights, googlenet
 
+
 # https://distill.pub/2017/feature-visualization
 GOOGLENET_DREAM_LAYER_WEIGHTS = {
   # "mixed3a": 1.0,
@@ -32,6 +33,7 @@ GOOGLENET_DREAM_TARGETS = {
   "mixed5b": [128, 384, 640, 896],        # 1024 channels
 }
 
+
 # VGG16 activation layers.
 VGG_RELU2_3 = 8
 VGG_RELU3_3 = 15
@@ -50,6 +52,7 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 GRADIENT_EPSILON = 1e-8
+
 
 # High-resolution DeepDream strategy:
 # 1. Dream a coarse copy to generate large coherent hallucinations.
@@ -80,6 +83,7 @@ class DeepDream:
     tile_size=DEFAULT_TILE_SIZE,
     tile_overlap=DEFAULT_TILE_OVERLAP,
     model_name="vgg16",
+    preserve_color=False,
   ):
     self.device = device
     self.steps = steps
@@ -90,6 +94,7 @@ class DeepDream:
     self.tile_size = tile_size
     self.tile_overlap = tile_overlap
     self.model_name = model_name
+    self.preserve_color = preserve_color
 
     if self.model_name == "vgg16":
       self.model = vgg16(
@@ -316,8 +321,19 @@ class DeepDream:
         create_graph=False,
       )[0]
 
-      # gradient = gradient / gradient.std().clamp_min(GRADIENT_EPSILON)
-      gradient = gradient / gradient.abs().mean().clamp_min(GRADIENT_EPSILON)
+      # Normalize gradient strength.
+      gradient = (
+        gradient
+        / gradient.abs().mean().clamp_min(GRADIENT_EPSILON)
+      )
+
+      # Prevent DeepDream from generating independent RGB color changes.
+      # A single shared gradient is applied equally to R, G, and B.
+      if self.preserve_color:
+        gradient = gradient.mean(
+          dim=1,
+          keepdim=True,
+        ).expand_as(gradient)
 
       dreamed = (
         dreamed

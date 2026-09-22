@@ -105,6 +105,7 @@ def main():
     octave_scale=args.octave_scale,
     max_whole_frame_width=0,
     model_name=args.model,
+    preserve_color=True,
   )
 
   print(f"Requested model: {args.model}")
