@@ -246,7 +246,35 @@ class DeepDream:
       # full-resolution source image.
       detail = dreamed - octave_base
 
+    if self.preserve_color:
+      dreamed = self._preserve_source_color(
+        dreamed,
+        original,
+      )
+
     return dreamed
+
+  def _preserve_source_color(self, dreamed, source):
+    """
+    Preserve the source image's color while retaining dreamed luminance/detail.
+    """
+    dreamed_luma = (
+      dreamed[:, 0:1] * 0.299
+      + dreamed[:, 1:2] * 0.587
+      + dreamed[:, 2:3] * 0.114
+    )
+
+    source_luma = (
+      source[:, 0:1] * 0.299
+      + source[:, 1:2] * 0.587
+      + source[:, 2:3] * 0.114
+    )
+
+    source_chroma = source - source_luma
+
+    return (
+      dreamed_luma + source_chroma
+    ).clamp(0.0, 1.0)
 
   def _build_octave_pyramid(self, image):
     """
@@ -321,19 +349,11 @@ class DeepDream:
         create_graph=False,
       )[0]
 
-      # Normalize gradient strength.
+      # gradient = gradient / gradient.std().clamp_min(GRADIENT_EPSILON)
       gradient = (
         gradient
         / gradient.abs().mean().clamp_min(GRADIENT_EPSILON)
       )
-
-      # Prevent DeepDream from generating independent RGB color changes.
-      # A single shared gradient is applied equally to R, G, and B.
-      if self.preserve_color:
-        gradient = gradient.mean(
-          dim=1,
-          keepdim=True,
-        ).expand_as(gradient)
 
       dreamed = (
         dreamed
